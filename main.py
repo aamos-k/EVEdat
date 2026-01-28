@@ -37,6 +37,15 @@ print("Loading SDE…")
 conn = sqlite3.connect(DB_PATH)
 cur = conn.cursor()
 
+# Blueprint manufacturing times (in hours)
+bp_times = {}
+for bp_typeID, activityID, time_sec in cur.execute("""
+    SELECT typeID, activityID, time
+    FROM industryActivity
+    WHERE activityID = 1
+"""):
+    bp_times[bp_typeID] = time_sec / 3600  # convert seconds → hours
+
 # invTypes table
 types = {}
 for tid, name, vol, groupID in cur.execute("""
@@ -211,60 +220,78 @@ def mining_time_for(mineral_tid, qty):
 # ============================================================================
 # RECURSIVE COST CALCULATION (OPTIMIZED)
 # ============================================================================
-@lru_cache(None)
-def cost_to_build(tid):
-    """Return (isk_cost, mining_hours, pi_hours, bp_cost, bp_price_one_time)."""
 
-    # No blueprint = raw material
+def cost_to_build(tid, _stack=None):
+    """Safe recursive cost calculator with loop detection."""
+    if _stack is None:
+        _stack = set()
+
+    # Detect recursion cycle
+    if tid in _stack:
+        # Fallback: treat as raw material → use market price
+        return (get_price(tid), 0, 0, 0, 0, 0)
+
+    _stack.add(tid)
+
+    # No blueprint → raw material
     if tid not in product_to_bp:
         if ENABLE_SELF_SUFFICIENT:
             if is_mineral(tid):
-                return (0, 0, 0, 0, 0)
+                _stack.remove(tid)
+                return (0, 0, 0, 0, 0, 0)
             if is_pi(tid):
-                return (0, 0, 0.01, 0, 0)
-        return (get_price(tid), 0, 0, 0, 0)
+                _stack.remove(tid)
+                return (0, 0, 0.01, 0, 0, 0)
 
-    materials = get_materials(tid)
+        _stack.remove(tid)
+        return (get_price(tid), 0, 0, 0, 0, 0)
+
+    bp_tid = product_to_bp[tid]
+    materials = bp_materials.get(bp_tid, [])
 
     total_isk = 0
-    mine_hours = 0
-    pi_hours = 0
-    bp_cost_total = 0
+    total_mine = 0
+    total_pi = 0
+    total_bp_cost = 0
+    total_manufacture_hours = bp_times.get(bp_tid, 0)
 
+    
     for mat_id, qty in materials:
+        # Self-sufficient minerals
+        if ENABLE_SELF_SUFFICIENT and is_mineral(mat_id):
+            total_mine += mining_time_for(mat_id, qty)
+            continue
 
-        # Self-sufficient logic
-        if ENABLE_SELF_SUFFICIENT:
-            if is_mineral(mat_id):
-                mine_hours += mining_time_for(mat_id, qty)
-                continue
-            if is_pi(mat_id):
-                pi_hours += qty * 0.01
-                continue
+        # Self-sufficient PI
+        if ENABLE_SELF_SUFFICIENT and is_pi(mat_id):
+            total_pi += qty * 0.01
+            continue
 
-        sub_isk, sub_mine, sub_pi, sub_bp_cost, sub_bp_price = cost_to_build(mat_id)
+        sub_isk, sub_mine, sub_pi, sub_bp, _, sub_manufacture = cost_to_build(mat_id, _stack)
 
         total_isk += sub_isk * qty
-        mine_hours += sub_mine * qty
-        pi_hours += sub_pi * qty
-        bp_cost_total += sub_bp_cost * qty
+        total_mine += sub_mine * qty
+        total_pi += sub_pi * qty
+        total_bp_cost += sub_bp * qty
+        total_manufacture_hours += sub_manufacture * qty
+        
+    # Blueprint amortization
+    bp_full_price = get_price(bp_tid)
+    amort = (bp_full_price / BLUEPRINT_RUNS) if INCLUDE_BLUEPRINT_COST else 0
+    total_bp_cost += amort
 
-    # Add blueprint amortization
-    bp_tid = product_to_bp.get(tid)
-    bp_price_full = get_price(bp_tid)
-
-    amortized = (bp_price_full / BLUEPRINT_RUNS) if INCLUDE_BLUEPRINT_COST and BLUEPRINT_RUNS > 0 else 0
-    bp_cost_total += amortized
-
-    # divide by output quantity
+    # Divide by output quantity
     out_qty = get_output_qty(tid)
     if out_qty > 1:
         total_isk /= out_qty
-        mine_hours /= out_qty
-        pi_hours /= out_qty
-        bp_cost_total /= out_qty
+        total_mine /= out_qty
+        total_pi /= out_qty
+        total_bp_cost /= out_qty
+        total_manufacture_hours /= out_qty
 
-    return (total_isk, mine_hours, pi_hours, bp_cost_total, bp_price_full)
+    _stack.remove(tid)
+    return (total_isk, total_mine, total_pi, total_bp_cost, bp_full_price, total_manufacture_hours)
+
 
 # ============================================================================
 # ALL PRODUCT FILTERING (same as your script)
@@ -339,36 +366,35 @@ def analyze():
         if volume < MIN_DAILY_VOLUME:
             continue
 
-        build_isk, mine_h, pi_h, bp_cost, bp_price_full = cost_to_build(tid)
-
+        build_isk, mine_h, pi_h, bp_cost, bp_price_full, manuf_h = cost_to_build(tid)
+        
+        # Scale for UNITS_TO_COMPARE
         build_isk *= UNITS_TO_COMPARE
         mine_h *= UNITS_TO_COMPARE
         pi_h *= UNITS_TO_COMPARE
         bp_cost *= UNITS_TO_COMPARE
-
-        sell_value = get_price(tid) * UNITS_TO_COMPARE
-        total_cost = build_isk + bp_cost
-        profit = sell_value - total_cost
-
+        manuf_h *= UNITS_TO_COMPARE
+        
         entry = {
             "type_id": tid,
             "name": types[tid]["name"],
             "build_cost": build_isk,
             "blueprint_cost": bp_cost,
             "blueprint_price": bp_price_full,
-            "total_cost": total_cost,
-            "sell_value": sell_value,
-            "profit": profit,
-            "daily_volume": volume,
+            "total_cost": build_isk + bp_cost,
+            "sell_value": get_price(tid) * UNITS_TO_COMPARE,
+            "profit": get_price(tid) * UNITS_TO_COMPARE - (build_isk + bp_cost),
+            "daily_volume": get_volume(tid),
             "mining_hours": mine_h,
             "pi_hours": pi_h,
-            "total_hours": mine_h + pi_h,
+            "manufacturing_hours": manuf_h,           # NEW
+            "total_hours": mine_h + pi_h + manuf_h,   # include manufacturing
         }
-
+        
         entry["isk_per_hour"] = (
-            profit / (entry["total_hours"]) if entry["total_hours"] > 0 else 0
+            entry["profit"] / entry["total_hours"] if entry["total_hours"] > 0 else 0
         )
-
+        
         results.append(entry)
 
     df = pd.DataFrame(results)
